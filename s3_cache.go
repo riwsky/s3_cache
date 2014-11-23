@@ -2,7 +2,8 @@ package main
 
 import (
 	"container/list"
-    "crypto/md5"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,7 +23,7 @@ type getResult struct {
 	localPath        *string
 	bucketName       string
 	bytesTransferred int64
-    md5 string
+	md5              string
 }
 
 func (r *getResult) MarshalJSON() ([]byte, error) {
@@ -43,45 +44,58 @@ type CachedKeyGetter interface {
 }
 
 type s3Conn struct {
-	conn *s3.S3
+	*s3.S3
 }
 
-func (s *s3Conn) getKey(bucket *s3.Bucket, keyName string) getResult {
+type keyReaderGetter interface {
+	getKeyReader(bucketName, keyName string) (io.ReadCloser, error)
+}
+
+func (s *s3Conn) getKeyReader(bucketName, keyName string) (io.ReadCloser, error) {
+	bucket := s.Bucket(bucketName)
+	return bucket.GetReader(keyName)
+}
+
+type tempKeyGetter struct {
+	keyReaderGetter
+}
+
+func (t *tempKeyGetter) getKey(bucketName, keyName string) getResult {
 	result := getResult{keyName: keyName}
-	rc, err := bucket.GetReader(keyName)
+	rc, err := t.getKeyReader(bucketName, keyName)
 	defer rc.Close()
 	if err != nil {
 		result.status = err.Error()
 		return result
 	}
 	f, err := ioutil.TempFile(os.TempDir(), "s3cache_")
+	defer f.Close()
 	if err != nil {
 		result.status = err.Error()
 		return result
 	}
-    h := md5.New() 
+	h := md5.New()
 	written, err := io.Copy(io.MultiWriter(f, h), rc)
 	if err != nil {
 		result.status = err.Error()
 		return result
 	}
 
-	localPath := path.Join(os.TempDir(), f.Name())
+	localPath := f.Name()
 	result.status = fmt.Sprintf("cache miss, transferred %v bytes", written)
 	result.localPath = &localPath
 	result.bytesTransferred = written
-    result.md5 = string(h.Sum(nil))
+	result.md5 = hex.Dump(h.Sum(nil))
 	return result
 }
 
-func (s s3Conn) get(bucketName string, keyNames []string) []getResult {
-	bucket := s.conn.Bucket(bucketName)
-	out := make([]getResult, len(keyNames))
+func (t *tempKeyGetter) get(bucketName string, keyNames []string) []getResult {
+	out := make([]getResult, 0, len(keyNames))
 	inbox := make(chan getResult)
 
 	for _, keyName := range keyNames {
 		go func(keyName string) {
-			inbox <- s.getKey(bucket, keyName)
+			inbox <- t.getKey(bucketName, keyName)
 		}(keyName)
 	}
 
@@ -113,7 +127,7 @@ func (b *boundedDiskCachedKeyGetter) keepClean(maxBytes int64) {
 		totalDownloaded += <-b.downloaded
 		if totalDownloaded > maxBytes {
 			b.lru.Lock()
-			for maxBytes - totalDownloaded > 0 {
+			for maxBytes-totalDownloaded > 0 {
 				oldestResult := b.lru.oldest()
 				if oldestResult == nil {
 					log.Printf("Above maxBytes %v with size of %v, but no entries left in lru!", maxBytes, totalDownloaded)
@@ -150,11 +164,12 @@ func (b *boundedDiskCachedKeyGetter) get(bucketName string, keyNames []string) [
 }
 
 type diskCachedKeyGetter struct {
-	base KeyGetter
+	base     KeyGetter
+	cacheDir string
 }
 
 func (d *diskCachedKeyGetter) remove(bucketName string, keyName string) bool {
-	err := os.Remove(pathFor(bucketName, keyName))
+	err := os.Remove(d.pathFor(bucketName, keyName))
 	return !os.IsNotExist(err)
 }
 
@@ -229,7 +244,7 @@ func (m *lruCachedKeyGetter) has(bucketName, keyName string) bool {
 }
 
 func (d *diskCachedKeyGetter) has(bucketName, keyName string) bool {
-	if _, err := os.Stat(pathFor(bucketName, keyName)); os.IsNotExist(err) {
+	if _, err := os.Stat(d.pathFor(bucketName, keyName)); os.IsNotExist(err) {
 		return false
 	} else {
 		return true
@@ -242,7 +257,7 @@ func (d *diskCachedKeyGetter) get(bucketName string, keyNames []string) []getRes
 	for _, keyName := range keyNames {
 		var result getResult
 		if d.has(bucketName, keyName) {
-			localPath := pathFor(bucketName, keyName)
+			localPath := d.pathFor(bucketName, keyName)
 			result = getResult{status: "disk cache hit", localPath: &localPath, keyName: keyName}
 			out = append(out, result)
 		} else {
@@ -265,12 +280,12 @@ func (d *diskCachedKeyGetter) get(bucketName string, keyNames []string) []getRes
 	return out
 }
 
-func pathFor(bucketName, keyName string) string {
-	return fmt.Sprintf("/tmp/%v/%v", bucketName, keyName)
+func (d *diskCachedKeyGetter) pathFor(bucketName, keyName string) string {
+	return path.Join(d.cacheDir, bucketName, keyName)
 }
 
 func (d *diskCachedKeyGetter) moveToCache(bucketName string, g getResult) (getResult, error) {
-	newPath := pathFor(bucketName, g.keyName)
+	newPath := d.pathFor(bucketName, g.keyName)
 	if g.localPath == nil {
 		return g, fmt.Errorf("no localPath for given getResult")
 	}
@@ -284,23 +299,71 @@ func (d *diskCachedKeyGetter) moveToCache(bucketName string, g getResult) (getRe
 }
 
 type md5ValidatingKeyGetter struct {
-    CachedKeyGetter
-    *s3.S3
+	CachedKeyGetter
+	*s3.S3
 }
 
-func (m *md5ValidatingKeyGetter) get(bucketName string, keyNames []string) {
+func md5For(conn *s3.S3, bucketName, keyName string) (string, error) {
+	listResp, err := conn.Bucket(bucketName).List("", "", keyName, 1)
+	if err != nil {
+		return "", err
+	}
+	etag := listResp.Contents[0].ETag
+	return etag[1 : len(etag)-1], nil
+}
+
+func (m *md5ValidatingKeyGetter) get(bucketName string, keyNames []string) []getResult {
+	presents := make([]string, 0)
+	absents := make([]string, 0, len(keyNames))
+	for _, keyName := range keyNames {
+		if m.has(bucketName, keyName) {
+			presents = append(presents, keyName)
+		} else {
+			absents = append(absents, keyName)
+		}
+	}
+	cached := m.CachedKeyGetter.get(bucketName, presents)
+	out := make([]getResult, len(keyNames))
+	for _, getResult := range cached {
+		currentMD5, err := md5For(m.S3, bucketName, getResult.keyName)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		if getResult.md5 == currentMD5 {
+			out = append(out, getResult)
+		} else {
+			m.CachedKeyGetter.remove(bucketName, getResult.keyName)
+			absents = append(absents, getResult.keyName)
+		}
+	}
+
+	fetcht := m.CachedKeyGetter.get(bucketName, absents)
+
+	for _, getResult := range fetcht {
+		out = append(out, getResult)
+	}
+
+	return out
 }
 
 type keyServer struct {
 	KeyGetter
 }
 
+type CacheRequest struct {
+	BucketName    string   `json:"bucket_name"`
+	KeyNames      []string `json:"keynames"`
+	MutableBucket bool     `json:"mutable_bucket"`
+}
+
 func (s *keyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	vs := r.Form
-	bucketName := vs["bucket_name"][0]
-	keyNames := vs["key_names"]
-	out, err := json.Marshal(s.get(bucketName, keyNames))
+	var cr CacheRequest
+	err := json.NewDecoder(r.Body).Decode(&cr)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+	}
+	out, err := json.Marshal(s.get(cr.BucketName, cr.KeyNames))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 	}
@@ -313,13 +376,14 @@ func main() {
 		log.Panicln(err)
 	}
 	conn := s3.New(auth, aws.USEast)
-	baseGetter := s3Conn{conn}
-	diskCachedGetter := &diskCachedKeyGetter{base: baseGetter}
+	s3Conn := s3Conn{conn}
+	tempDirGetter := &tempKeyGetter{&s3Conn}
+	diskCachedGetter := &diskCachedKeyGetter{base: tempDirGetter}
 	cache := make(map[string]map[string]*list.Element, 100)
 	lruCachedGetter := &lruCachedKeyGetter{cache: cache, base: diskCachedGetter}
 	downloadedChan := make(chan int64, 25)
 	boundedGetter := boundedDiskCachedKeyGetter{lru: lruCachedGetter, disk: diskCachedGetter, downloaded: downloadedChan}
-    go boundedGetter.keepClean(10*1024*1024) // 10 MB
+	go boundedGetter.keepClean(10 * 1024 * 1024) // 10 MB
 	server := keyServer{&boundedGetter}
 	http.Handle("/", &server)
 	http.ListenAndServe(":8780", nil)
