@@ -17,6 +17,7 @@ import (
 	"sync"
 )
 
+// A getResult represents an entry in the cache
 type getResult struct {
 	keyName          string
 	status           string
@@ -252,8 +253,8 @@ func (d *diskCachedKeyGetter) has(bucketName, keyName string) bool {
 }
 
 func (d *diskCachedKeyGetter) get(bucketName string, keyNames []string) []getResult {
-	out := make([]getResult, len(keyNames))
-	missing := make([]string, len(keyNames)/2)
+	out := make([]getResult, 0, len(keyNames))
+	missing := make([]string, 0, len(keyNames)/2)
 	for _, keyName := range keyNames {
 		var result getResult
 		if d.has(bucketName, keyName) {
@@ -298,9 +299,21 @@ func (d *diskCachedKeyGetter) moveToCache(bucketName string, g getResult) (getRe
 	return g, nil
 }
 
-type md5ValidatingKeyGetter struct {
-	CachedKeyGetter
-	*s3.S3
+// An EvictingMutableKeyGetter checks with a ShouldEvicter to determine
+// if a key should be deleted from the cache for mutable requests.
+// As this exposes the underlying CachedKeyGetter, eviction can be ignored
+// by using the .get(bucketName, keyNames) interface
+type EvictingMutableKeyGetter struct {
+	CachedKeyGetter 
+	ShouldEvicter
+}
+
+type ShouldEvicter interface {
+    ShouldEvict(getResult) (bool, error)
+}
+
+type md5ShouldEvicter struct {
+    *s3.S3
 }
 
 func md5For(conn *s3.S3, bucketName, keyName string) (string, error) {
@@ -312,43 +325,59 @@ func md5For(conn *s3.S3, bucketName, keyName string) (string, error) {
 	return etag[1 : len(etag)-1], nil
 }
 
-func (m *md5ValidatingKeyGetter) get(bucketName string, keyNames []string) []getResult {
+func (m *md5ShouldEvicter) ShouldEvict(r getResult) (bool, error) {
+    currentMD5, err := md5For(m.S3, r.bucketName, r.keyName)
+    if err != nil {
+        return false, err
+    }
+    if r.md5 == currentMD5 {
+        return false, nil
+    } else {
+        return true, nil
+    }
+}
+
+func (e *EvictingMutableKeyGetter) Get(bucketName string, keyNames []string, mutableBucket bool) []getResult {
 	presents := make([]string, 0)
 	absents := make([]string, 0, len(keyNames))
 	for _, keyName := range keyNames {
-		if m.has(bucketName, keyName) {
+		if e.has(bucketName, keyName) {
 			presents = append(presents, keyName)
 		} else {
 			absents = append(absents, keyName)
 		}
 	}
-	cached := m.CachedKeyGetter.get(bucketName, presents)
+	cached := e.get(bucketName, presents)
 	out := make([]getResult, len(keyNames))
 	for _, getResult := range cached {
-		currentMD5, err := md5For(m.S3, bucketName, getResult.keyName)
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		if getResult.md5 == currentMD5 {
+        if !mutableBucket {
+            out = append(out, getResult)
+        }
+        evict, err := e.ShouldEvict(getResult)
+		if err != nil && !evict {
 			out = append(out, getResult)
 		} else {
-			m.CachedKeyGetter.remove(bucketName, getResult.keyName)
+			e.remove(bucketName, getResult.keyName)
 			absents = append(absents, getResult.keyName)
 		}
 	}
 
-	fetcht := m.CachedKeyGetter.get(bucketName, absents)
-
-	for _, getResult := range fetcht {
-		out = append(out, getResult)
-	}
+    if len(absents) > 0 {
+        fetcht := e.get(bucketName, absents)
+        for _, getResult := range fetcht {
+            out = append(out, getResult)
+        }
+    } 
 
 	return out
 }
 
+type MutableKeyGetter interface {
+    Get(bucketName string, keyNames []string, mutableBucket bool) []getResult
+}
+
 type keyServer struct {
-	KeyGetter
+	MutableKeyGetter
 }
 
 type CacheRequest struct {
@@ -363,7 +392,7 @@ func (s *keyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 	}
-	out, err := json.Marshal(s.get(cr.BucketName, cr.KeyNames))
+	out, err := json.Marshal(s.Get(cr.BucketName, cr.KeyNames, cr.MutableBucket))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 	}
@@ -379,12 +408,9 @@ func main() {
 	s3Conn := s3Conn{conn}
 	tempDirGetter := &tempKeyGetter{&s3Conn}
 	diskCachedGetter := &diskCachedKeyGetter{base: tempDirGetter}
-	cache := make(map[string]map[string]*list.Element, 100)
-	lruCachedGetter := &lruCachedKeyGetter{cache: cache, base: diskCachedGetter}
-	downloadedChan := make(chan int64, 25)
-	boundedGetter := boundedDiskCachedKeyGetter{lru: lruCachedGetter, disk: diskCachedGetter, downloaded: downloadedChan}
-	go boundedGetter.keepClean(10 * 1024 * 1024) // 10 MB
-	server := keyServer{&boundedGetter}
+    evicter := md5ShouldEvicter{conn}
+    mutableGetter := EvictingMutableKeyGetter{diskCachedGetter, &evicter}
+	server := keyServer{&mutableGetter}
 	http.Handle("/", &server)
 	http.ListenAndServe(":8780", nil)
 }
