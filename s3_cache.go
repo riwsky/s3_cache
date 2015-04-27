@@ -290,6 +290,7 @@ func (d *diskCachedKeyGetter) moveToCache(bucketName string, g getResult) (getRe
 	if g.localPath == nil {
 		return g, fmt.Errorf("no localPath for given getResult")
 	}
+    //TODO cybriwsky: try to create the new directory, if needed
 	err := os.Rename(*g.localPath, newPath)
 	if err != nil {
 		return g, err
