@@ -259,7 +259,8 @@ func (d *diskCachedKeyGetter) get(bucketName string, keyNames []string) []getRes
 		var result getResult
 		if d.has(bucketName, keyName) {
 			localPath := d.pathFor(bucketName, keyName)
-			result = getResult{status: "disk cache hit", localPath: &localPath, keyName: keyName}
+			result = getResult{status: "disk cache hit", localPath: &localPath, keyName: keyName,
+				bucketName: bucketName}
 			out = append(out, result)
 		} else {
 			missing = append(missing, keyName)
@@ -270,11 +271,9 @@ func (d *diskCachedKeyGetter) get(bucketName string, keyNames []string) []getRes
 		for _, result := range results {
 			cachedResult, err := d.moveToCache(bucketName, result)
 			if err != nil {
-				log.Println(err)
 				cachedResult.status = err.Error()
 				cachedResult.localPath = nil
 			}
-
 			out = append(out, cachedResult)
 		}
 	}
@@ -290,13 +289,14 @@ func (d *diskCachedKeyGetter) moveToCache(bucketName string, g getResult) (getRe
 	if g.localPath == nil {
 		return g, fmt.Errorf("no localPath for given getResult")
 	}
-    //TODO cybriwsky: try to create the new directory, if needed
+	if err := os.MkdirAll(path.Dir(newPath), 0777); err != nil {
+		return g, fmt.Errorf("couldn't create directory to move getResult to")
+	}
 	err := os.Rename(*g.localPath, newPath)
 	if err != nil {
 		return g, err
 	}
 	g.localPath = &newPath
-	g.status = "cache hit"
 	return g, nil
 }
 
@@ -305,16 +305,16 @@ func (d *diskCachedKeyGetter) moveToCache(bucketName string, g getResult) (getRe
 // As this exposes the underlying CachedKeyGetter, eviction can be ignored
 // by using the .get(bucketName, keyNames) interface
 type EvictingMutableKeyGetter struct {
-	CachedKeyGetter 
+	CachedKeyGetter
 	ShouldEvicter
 }
 
 type ShouldEvicter interface {
-    ShouldEvict(getResult) (bool, error)
+	ShouldEvict(getResult) (bool, error)
 }
 
 type md5ShouldEvicter struct {
-    *s3.S3
+	*s3.S3
 }
 
 func md5For(conn *s3.S3, bucketName, keyName string) (string, error) {
@@ -327,15 +327,15 @@ func md5For(conn *s3.S3, bucketName, keyName string) (string, error) {
 }
 
 func (m *md5ShouldEvicter) ShouldEvict(r getResult) (bool, error) {
-    currentMD5, err := md5For(m.S3, r.bucketName, r.keyName)
-    if err != nil {
-        return false, err
-    }
-    if r.md5 == currentMD5 {
-        return false, nil
-    } else {
-        return true, nil
-    }
+	currentMD5, err := md5For(m.S3, r.bucketName, r.keyName)
+	if err != nil {
+		return false, err
+	}
+	if r.md5 == currentMD5 {
+		return false, nil
+	} else {
+		return true, nil
+	}
 }
 
 func (e *EvictingMutableKeyGetter) Get(bucketName string, keyNames []string, mutableBucket bool) []getResult {
@@ -351,10 +351,11 @@ func (e *EvictingMutableKeyGetter) Get(bucketName string, keyNames []string, mut
 	cached := e.get(bucketName, presents)
 	out := make([]getResult, len(keyNames))
 	for _, getResult := range cached {
-        if !mutableBucket {
-            out = append(out, getResult)
-        }
-        evict, err := e.ShouldEvict(getResult)
+		if !mutableBucket {
+			out = append(out, getResult)
+			continue
+		}
+		evict, err := e.ShouldEvict(getResult)
 		if err != nil && !evict {
 			out = append(out, getResult)
 		} else {
@@ -363,18 +364,18 @@ func (e *EvictingMutableKeyGetter) Get(bucketName string, keyNames []string, mut
 		}
 	}
 
-    if len(absents) > 0 {
-        fetcht := e.get(bucketName, absents)
-        for _, getResult := range fetcht {
-            out = append(out, getResult)
-        }
-    } 
+	if len(absents) > 0 {
+		fetcht := e.get(bucketName, absents)
+		for _, getResult := range fetcht {
+			out = append(out, getResult)
+		}
+	}
 
 	return out
 }
 
 type MutableKeyGetter interface {
-    Get(bucketName string, keyNames []string, mutableBucket bool) []getResult
+	Get(bucketName string, keyNames []string, mutableBucket bool) []getResult
 }
 
 type keyServer struct {
@@ -409,8 +410,8 @@ func main() {
 	s3Conn := s3Conn{conn}
 	tempDirGetter := &tempKeyGetter{&s3Conn}
 	diskCachedGetter := &diskCachedKeyGetter{base: tempDirGetter}
-    evicter := md5ShouldEvicter{conn}
-    mutableGetter := EvictingMutableKeyGetter{diskCachedGetter, &evicter}
+	evicter := md5ShouldEvicter{conn}
+	mutableGetter := EvictingMutableKeyGetter{diskCachedGetter, &evicter}
 	server := keyServer{&mutableGetter}
 	http.Handle("/", &server)
 	http.ListenAndServe(":8780", nil)

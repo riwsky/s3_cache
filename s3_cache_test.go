@@ -63,52 +63,63 @@ func TestTempKeyGetter(t *testing.T) {
 	}
 }
 
-type mockKeyGetter struct { 
-    os.File 
-    called int}
+type mockKeyGetter struct {
+	content string
+	called  int
+	dir     string
+}
+
+func (m *mockKeyGetter) getNewLocalName() string {
+	f, _ := ioutil.TempFile(m.dir, "")
+	f.Close()
+	ioutil.WriteFile(f.Name(), []byte(m.content), 777)
+	return f.Name()
+}
+
+const mockFetched = "mock fetched"
 
 func (m *mockKeyGetter) get(bucketName string, keyNames []string) []getResult {
-    m.called += 1
 	out := make([]getResult, 0, len(keyNames))
-	name := m.Name()
 
 	for _, keyName := range keyNames {
-		result := getResult{localPath: &name, keyName: keyName,
-			bucketName: bucketName}
+		localPath := m.getNewLocalName()
+		result := getResult{localPath: &localPath, keyName: keyName,
+			bucketName: bucketName, status: mockFetched}
+		m.called += 1
 		out = append(out, result)
 	}
 	return out
 }
 
-func newMockKeyGetter(content string) (*mockKeyGetter, error) {
-	f, err := ioutil.TempFile(os.TempDir(), "")
-	f.Write([]byte(content))
-	return &mockKeyGetter{*f,0}, err
+func newMockKeyGetter(content string) *mockKeyGetter {
+	tempDir, _ := ioutil.TempDir("", "test_mock_key_getter")
+	return &mockKeyGetter{content, 0, tempDir}
 }
 
 func TestDiskCachedKeyGetter(t *testing.T) {
 	sampleContent := "sample content"
-	base, err := newMockKeyGetter(sampleContent)
-	defer os.Remove(base.Name())
+	base := newMockKeyGetter(sampleContent)
+	defer os.RemoveAll(base.dir)
+	cacheDir, err := ioutil.TempDir("", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cacheDir := "/tmp/cachetest"
+	defer os.RemoveAll(cacheDir)
 	var ckg CachedKeyGetter = &diskCachedKeyGetter{base: base, cacheDir: cacheDir}
 	keyNames := []string{"key1", "key2"}
-    if base.called != 0 {
-        t.Logf("Expected 0 calls, but had %v", base.called)
-        t.Fail()
-    }
+	if base.called != 0 {
+		t.Logf("Expected 0 calls, but had %v", base.called)
+		t.Fail()
+	}
 
 	firstResults := ckg.get("bucket", keyNames)
 	if len(firstResults) != len(keyNames) {
 		t.Fatalf("Expected %v results, but found %v", len(keyNames), len(firstResults))
 	}
-    if base.called != len(keyNames) {
-        t.Logf("Expected %v calls, but had %v", len(keyNames), base.called)
-        t.Fail()
-    }
+	if base.called != len(keyNames) {
+		t.Logf("Expected %v calls, but had %v", len(keyNames), base.called)
+		t.Fail()
+	}
 
 	checkResultsReturningPaths := func(results []getResult) map[string]string {
 		paths := make(map[string]string)
@@ -123,10 +134,6 @@ func TestDiskCachedKeyGetter(t *testing.T) {
 				t.Fail()
 			}
 			paths[result.keyName] = *result.localPath
-			if !strings.Contains(result.status, "cache miss") {
-				t.Logf("Expected a cache miss on the first get, but got %v", result.status)
-				t.Fail()
-			}
 
 			compareContents(sampleContent, *result.localPath, t)
 
@@ -134,18 +141,33 @@ func TestDiskCachedKeyGetter(t *testing.T) {
 				t.Logf("Expected results %v to be downloaded to cache dir %v", *result.localPath, cacheDir)
 				t.Fail()
 			}
+
 		}
 		return paths
 	}
 
 	firstPaths := checkResultsReturningPaths(firstResults)
+	for _, result := range firstResults {
+		if !strings.Contains(result.status, mockFetched) {
+			t.Logf("Expected a mock fetch on the first get, but got %v", result.status)
+			t.Fail()
+		}
+	}
 	secondResults := ckg.get("bucket", keyNames)
 
-    if base.called != len(keyNames) {
-        t.Logf("Expected the number of calls to stay at %v, but had %v", len(keyNames), base.called)
-        t.Fail()
-    }
+	if base.called != len(keyNames) {
+		t.Logf("Expected the number of calls to stay at %v, but had %v", len(keyNames), base.called)
+		t.Fail()
+	}
 	secondPaths := checkResultsReturningPaths(secondResults)
+
+	for _, result := range secondResults {
+		if !strings.Contains(result.status, "disk cache hit") {
+			t.Logf("Expected a disk cache hit on the first get, but got %v", result.status)
+			t.Fail()
+		}
+	}
+
 	for k, v := range firstPaths {
 		if secondPaths[k] != v {
 			t.Logf("Got %v for %v on the first get, but %v on the second", v, k, secondPaths[k])
@@ -187,57 +209,54 @@ func TestUnmarshalling(t *testing.T) {
 type ShouldEvictFunc func(getResult) (bool, error)
 
 func (s ShouldEvictFunc) ShouldEvict(r getResult) (bool, error) {
-    return s(r)
+	return s(r)
 }
 
 func TestEvictingMutableKeyGetter(t *testing.T) {
-    base, err := newMockKeyGetter("sample content")
-    defer os.Remove(base.Name())
+	base := newMockKeyGetter("sample content")
+	defer os.RemoveAll(base.dir)
+	tempDir, err := ioutil.TempDir("", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-    dbkg := diskCachedKeyGetter{base, os.TempDir()}
-    var evicter ShouldEvicter = ShouldEvictFunc(func(r getResult) (bool, error) {
-        return true, nil
-        })
-    emkg := EvictingMutableKeyGetter{&dbkg, evicter}
-    _ = emkg.Get("bucket", []string{"key1"}, false)
-    if base.called != 1 {
-        t.Fatalf("Expected only one call to the base getter after the first call, but had %v", base.called)
-    }
-    _ = emkg.Get("bucket", []string{"key1"}, false)
-    if base.called != 1 {
-        t.Fatalf("Expected only one call to the base getter after the second call, but had %v", base.called)
-    }
-    _ = emkg.Get("bucket", []string{"key1"}, true)
-    if base.called != 2 {
-        t.Fatalf("Expected a second call to the base getter after a mutable call, but had %v", base.called)
-    }
-
-
+	defer os.RemoveAll(tempDir)
+	dbkg := diskCachedKeyGetter{base, tempDir}
+	var evicter ShouldEvicter = ShouldEvictFunc(func(r getResult) (bool, error) {
+		return true, nil
+	})
+	emkg := EvictingMutableKeyGetter{&dbkg, evicter}
+	results := emkg.Get("bucket", []string{"key1"}, false)
+	if base.called != 1 {
+		t.Logf("results log %v", results)
+		t.Fatalf("Expected only one call to the base getter after the first call, but had %v", base.called)
+	}
+	_ = emkg.Get("bucket", []string{"key1"}, false)
+	if base.called != 1 {
+		t.Fatalf("Expected only one call to the base getter after the second call, but had %v", base.called)
+	}
+	_ = emkg.Get("bucket", []string{"key1"}, true)
+	if base.called != 2 {
+		t.Fatalf("Expected a second call to the base getter after a mutable call, but had %v", base.called)
+	}
 
 }
 
 type ignoringMutableKeyGetter struct {
-    KeyGetter
+	KeyGetter
 }
 
 func (i ignoringMutableKeyGetter) Get(bucketName string, keyNames []string, mutable bool) []getResult {
-    return i.get(bucketName, keyNames)
+	return i.get(bucketName, keyNames)
 }
 
 func TestKeyServer(t *testing.T) {
-    t.Skip()
-	base, err := newMockKeyGetter("sample content")
-	defer os.Remove(base.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Skip()
+	base := newMockKeyGetter("sample content")
+	defer os.RemoveAll(base.dir)
 
 	ks := keyServer{ignoringMutableKeyGetter{base}}
 	ts := httptest.NewServer(&ks)
 	defer ts.Close()
 
 	http.Post(ts.URL, "application/json", bytes.NewReader(rawRequest))
-
 }
